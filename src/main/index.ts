@@ -4,16 +4,140 @@ import fs from 'fs';
 import os from 'os';
 import { execSync } from 'child_process';
 import { AcpClient } from './acp-client';
+import { AgentProfile, DEFAULT_MODEL, deriveProjectId, canAssignProjectId } from './config';
+import * as store from './sessionStore';
+import { buildMemoryInjection, deleteProjectMemory, deleteSessionMemory, readMemory, writeMemory } from './memory';
 
 let mainWindow: BrowserWindow | null = null;
 let splashWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let isQuitting = false;
 
-// One kiro-cli process per model (per-session model support)
-const clients: Map<string, AcpClient> = new Map();
-const connectingClients: Map<string, Promise<AcpClient>> = new Map();
-const DEFAULT_MODEL = 'claude-opus-4.6';
+// PER-SESSION executors (design §3): exactly one AcpClient process per session,
+// keyed by sessionId. Replaces the previous per-model pooling. This gives
+// isolation by construction, per-session targets, and clean independent
+// migrate/reconnect (later PRs).
+interface SessionEntry {
+  client: AcpClient;
+  /** kiro-cli's session id for this executor. The Map key is the KiroLex id;
+   *  client calls (sendPrompt/cancel/load) use THIS. */
+  cliSessionId: string;
+  profile: AgentProfile;
+  /** accumulates the in-flight assistant response; flushed to the durable
+   *  store only when the turn completes (asymmetric durability, §7). */
+  assistantBuf: string;
+  assistantMsgId: string | null;
+  /** whether layered memory has been injected on this executor's first prompt
+   *  (design §6.4) — re-armed each time a fresh executor attaches. */
+  memoryInjected: boolean;
+  /** the projectId used in the last memory injection; re-inject if it changes. */
+  injectedProjectId?: string;
+  /** the exact memory block last injected; re-inject when the content changes
+   *  (so same-project chats pick up each other's memory writes). */
+  lastInjectedMemory?: string;
+  /** LRU bookkeeping: last time this executor was created/attached/prompted.
+   *  Used to pick an eviction victim when the attached-executor cap is hit. */
+  lastUsedAt: number;
+  /** true while a prompt turn is in flight — a busy executor is never evicted. */
+  busy?: boolean;
+}
+const sessionClients: Map<string, SessionEntry> = new Map();
+// Soft cap on ATTACHED executors (design §8). Dormant sessions are unbounded.
+// Auto-sized from host resources (like MeshClaw's compute_max_subagents): each
+// kiro-cli executor is a heavy process (~0.4GB), so bound by BOTH a memory
+// budget (~half of total RAM) and CPU count, clamped to a sane [4, 16] range.
+function computeExecutorCap(): number {
+  const cpus = os.cpus()?.length || 4;
+  const totalGB = os.totalmem() / 2 ** 30;
+  const PER_EXEC_GB = 0.4;   // rough per-executor footprint
+  const RAM_BUDGET = 0.5;    // use up to ~50% of total RAM for warm executors
+  const memCap = Math.floor((totalGB * RAM_BUDGET) / PER_EXEC_GB);
+  const cpuCap = cpus * 2;   // up to 2 executors per core
+  return Math.max(4, Math.min(16, memCap, cpuCap));
+}
+const MAX_CONCURRENT_SESSIONS = computeExecutorCap();
+
+/** Wire a freshly-created client's events, routing everything by sessionId. */
+function wireSession(sessionId: string, entry: SessionEntry) {
+  const { client } = entry;
+  client.on('update', (data: any) => {
+    // Accumulate assistant text so we can persist the COMPLETE message on
+    // turn end (never the in-flight partial, §7). The ACP session/update
+    // payload is { sessionId, update: { sessionUpdate, content: { text } } }.
+    try {
+      const u = data?.update;
+      if (u?.sessionUpdate === 'agent_message_chunk') {
+        entry.assistantBuf += u?.content?.text || '';
+        if (!entry.assistantMsgId) entry.assistantMsgId = u?.messageId || `a_${Date.now()}`;
+      }
+    } catch {}
+    mainWindow?.webContents.send('acp:update', { ...data, sessionId });
+  });
+  client.on('error', (error: any) => {
+    mainWindow?.webContents.send('acp:error', { ...error, sessionId });
+  });
+  client.on('disconnected', () => {
+    // Identity guard: a detached executor's process 'close' fires asynchronously.
+    // If the session was already re-attached (move-reset, LRU, reconnect), the
+    // map now holds a DIFFERENT entry — this stale event must not delete it or
+    // spuriously notify the renderer.
+    if (sessionClients.get(sessionId) !== entry) return;
+    sessionClients.delete(sessionId);
+    const rec = store.readRecord(sessionId);
+    if (rec) { rec.executorState = 'detached'; store.writeRecord(rec); }
+    mainWindow?.webContents.send('acp:disconnected', { sessionId });
+  });
+}
+
+/** Flush the accumulated assistant message to the durable transcript (called on
+ *  turn completion). No-op if nothing accumulated. */
+function flushAssistant(sessionId: string) {
+  const entry = sessionClients.get(sessionId);
+  if (!entry || !entry.assistantBuf) return;
+  store.appendMessage(sessionId, {
+    id: entry.assistantMsgId || `a_${Date.now()}`,
+    role: 'assistant',
+    content: entry.assistantBuf,
+    ts: Date.now(),
+  });
+  entry.assistantBuf = '';
+  entry.assistantMsgId = null;
+}
+
+/** Actively detach one session's executor: free the slot immediately, kill the
+ *  kiro-cli process, mark the record dormant, and tell the renderer (dot ->
+ *  dormant). The session's durable transcript + memory are untouched; a later
+ *  prompt/open transparently re-attaches (loadSession). */
+function detachExecutor(sessionId: string) {
+  const entry = sessionClients.get(sessionId);
+  if (!entry) return;
+  sessionClients.delete(sessionId); // free the slot synchronously
+  try { entry.client.disconnect(); } catch { /* process may already be gone */ }
+  const rec = store.readRecord(sessionId);
+  if (rec) { rec.executorState = 'detached'; store.writeRecord(rec); }
+  mainWindow?.webContents.send('acp:disconnected', { sessionId });
+}
+
+/** LRU auto-detach: before attaching another executor, evict the least-recently-
+ *  used NON-busy executor(s) until there is room under the cap. This removes the
+ *  hard ceiling — dormant sessions are unbounded and the coldest live one is
+ *  recycled on demand. `excludeId` protects the session about to be (re)attached.
+ *  If every live executor is busy (all mid-turn), we cannot evict and the caller
+ *  falls back to rejecting, so a streaming turn is never killed. */
+function ensureExecutorCapacity(excludeId?: string): boolean {
+  while (sessionClients.size >= MAX_CONCURRENT_SESSIONS) {
+    let victim: string | null = null;
+    let oldest = Infinity;
+    for (const [id, e] of sessionClients) {
+      if (id === excludeId || e.busy) continue;
+      const t = e.lastUsedAt ?? 0;
+      if (t < oldest) { oldest = t; victim = id; }
+    }
+    if (!victim) return false; // all remaining executors are busy — cannot evict
+    detachExecutor(victim);
+  }
+  return true;
+}
 
 // Enforce single instance to prevent localStorage/leveldb corruption from
 // multiple processes (the tray keeps the app alive after closing the window)
@@ -123,45 +247,8 @@ function getSessionDir(sessionId?: string): string {
   return dir;
 }
 
-// Get or create a connected kiro-cli client for the given model
-async function getClient(model: string): Promise<AcpClient> {
-  const m = model || DEFAULT_MODEL;
-  const existing = clients.get(m);
-  if (existing) return existing;
-
-  // Dedupe concurrent creation for the same model
-  const pending = connectingClients.get(m);
-  if (pending) return pending;
-
-  const createPromise = (async () => {
-    const client = new AcpClient(m, shellEnv);
-    // Tag all forwarded events with the model so the renderer can route
-    client.on('update', (data) => {
-      mainWindow?.webContents.send('acp:update', { ...data, model: m });
-    });
-    client.on('error', (error) => {
-      mainWindow?.webContents.send('acp:error', { ...error, model: m });
-    });
-    client.on('disconnected', () => {
-      clients.delete(m);
-      connectingClients.delete(m);
-      mainWindow?.webContents.send('acp:disconnected', { model: m });
-    });
-
-    await client.connect();
-    clients.set(m, client);
-    connectingClients.delete(m);
-    return client;
-  })();
-
-  connectingClients.set(m, createPromise);
-  try {
-    return await createPromise;
-  } catch (err) {
-    connectingClients.delete(m);
-    throw err;
-  }
-}
+// (per-model getClient removed — executors are now created per-session in the
+//  acp:new-session / acp:load-session handlers, keyed by sessionId.)
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -302,7 +389,7 @@ function createSplashWindow() {
       <div style="text-align:center;">
         <div style="font-size:40px; margin-bottom:12px;">⚡</div>
         <div style="font-size:16px; font-weight:600; margin-bottom:16px;">KiroLex</div>
-        <div style="font-size:12px; color:#a0a0a0; margin-bottom:12px;">Connecting...</div>
+        <div id="splash-status" style="font-size:12px; color:#a0a0a0; margin-bottom:12px;">Starting…</div>
         <div style="width:120px; height:3px; background:#333; border-radius:2px; margin:0 auto; overflow:hidden;">
           <div style="width:40px; height:100%; background:#7c6fe0; border-radius:2px; animation:loading 1.2s ease-in-out infinite;"></div>
         </div>
@@ -334,6 +421,9 @@ function showMainWindow() {
 }
 
 app.whenReady().then(() => {
+  // No executors survive a restart — reset any stale live executorState so the
+  // durable records are truthful from boot.
+  try { store.markAllExecutorsDetached(); } catch {}
   // Clear leftover pasted-image temp files from previous runs
   try {
     const pastedDir = path.join(os.homedir(), '.kirolex', 'pasted');
@@ -354,52 +444,130 @@ app.whenReady().then(() => {
   }, 15000);
 
   // IPC handlers
-  ipcMain.handle('acp:connect', async (_event, options: { model?: string }) => {
+  ipcMain.handle('acp:connect', async () => {
+    // Backend readiness only — does NOT reveal. The window is shown via
+    // acp:reveal after the renderer finishes warming sessions behind the splash.
+    return { connected: true };
+  });
+
+  // Update the splash status line while the renderer warms sessions behind it.
+  ipcMain.handle('acp:splash-status', async (_event, text: string) => {
     try {
-      const client = await getClient(options.model || DEFAULT_MODEL);
-      clearTimeout(splashTimeout);
-      showMainWindow();
-      // Return a synthetic init result (client is connected)
-      return { connected: true };
-    } catch (err) {
-      clearTimeout(splashTimeout);
-      showMainWindow();
-      throw err;
-    }
+      if (splashWindow && !splashWindow.isDestroyed()) {
+        await splashWindow.webContents.executeJavaScript(
+          `(function(){var e=document.getElementById('splash-status'); if(e) e.textContent=${JSON.stringify(String(text))};})()`
+        );
+      }
+    } catch { /* splash may have closed */ }
+    return { ok: true };
+  });
+
+  // Reveal the main window once the renderer has established its session
+  // connections behind the splash (called after eager-attach completes). The
+  // splashTimeout above is the safety net if warming is slow or fails.
+  ipcMain.handle('acp:reveal', async () => {
+    clearTimeout(splashTimeout);
+    showMainWindow();
+    return { revealed: true };
   });
 
   ipcMain.handle('acp:disconnect', async () => {
-    for (const [, client] of clients) {
-      try { await client.disconnect(); } catch {}
+    for (const [, entry] of sessionClients) {
+      try { await entry.client.disconnect(); } catch {}
     }
-    clients.clear();
-    connectingClients.clear();
+    sessionClients.clear();
   });
 
-  ipcMain.handle('acp:new-session', async (_event, cwd: string, model: string) => {
-    const client = await getClient(model);
-    // Use unique directory per session to isolate from other sessions
-    const sessionDir = getSessionDir();
-    return client.newSession(sessionDir);
+  ipcMain.handle('acp:new-session', async (_event, kiroLexId: string, cwd: string, model: string, projectId?: string) => {
+    if (!ensureExecutorCapacity()) {
+      throw new Error('All live sessions are busy; cannot start another right now.');
+    }
+    const sessionDir = getSessionDir(kiroLexId);
+    const resolvedCwd = cwd === '~' ? os.homedir() : cwd;
+    const derived = resolvedCwd === os.homedir() ? undefined : deriveProjectId(resolvedCwd);
+    const profile: AgentProfile = { model: model || DEFAULT_MODEL, projectId: projectId ?? derived };
+    const client = new AcpClient(profile.model, shellEnv);
+    await client.connect();
+    const { sessionId: cliSessionId } = await client.newSession(sessionDir);
+    const entry: SessionEntry = { client, cliSessionId, profile, assistantBuf: '', assistantMsgId: null, memoryInjected: false, lastUsedAt: Date.now() };
+    sessionClients.set(kiroLexId, entry);
+    wireSession(kiroLexId, entry);
+    // Durable record (design §4), keyed by the KiroLex id; store the cli mapping.
+    const rec = store.createSession(kiroLexId, profile);
+    rec.cliSessionId = cliSessionId;
+    rec.executorState = 'attached';
+    store.writeRecord(rec);
+    mainWindow?.webContents.send('session:ready-for-first-prompt', { sessionId: kiroLexId, projectId: profile.projectId });
+    return { sessionId: kiroLexId };
   });
 
-  ipcMain.handle('acp:prompt', async (_event, sessionId: string, prompt: any[], model: string) => {
-    const client = await getClient(model);
-    return client.sendPrompt(sessionId, prompt);
+  ipcMain.handle('acp:prompt', async (_event, sessionId: string, prompt: any[], _model?: string, projectId?: string) => {
+    const entry = sessionClients.get(sessionId);
+    if (!entry) throw new Error('Session not connected');
+    // Most-recently-used: protect this session from LRU eviction this turn.
+    entry.lastUsedAt = Date.now();
+    // Reconcile the renderer's authoritative projectId onto the executor + record
+    // (covers assignment after attach, and executor/profile drift).
+    if (projectId !== undefined && projectId !== entry.profile.projectId) {
+      entry.profile.projectId = projectId;
+      const r = store.readRecord(sessionId);
+      if (r) { r.profile.projectId = projectId; store.writeRecord(r); }
+    }
+    const effectiveProjectId = projectId ?? entry.profile.projectId;
+    // Persist the user message the instant it is sent (asymmetric durability, §7).
+    try {
+      const text = Array.isArray(prompt)
+        ? prompt.map((p: any) => (typeof p === 'string' ? p : p?.text || '')).join('')
+        : String(prompt ?? '');
+      store.appendMessage(sessionId, { id: `u_${Date.now()}`, role: 'user', content: text, ts: Date.now() });
+    } catch {}
+    // Inject layered memory (global ⊕ project) on the first prompt AND whenever
+    // the memory CONTENT changes (project switch, or another chat wrote to the
+    // shared file). Rebuilt from disk each prompt; only re-injected when it
+    // differs from the last injection. AFTER persisting the user message so
+    // memory never lands in the transcript.
+    try {
+      const block = buildMemoryInjection(effectiveProjectId, sessionId);
+      if (block && block !== entry.lastInjectedMemory) {
+        prompt = [{ type: 'text', text: block }, ...prompt];
+        entry.lastInjectedMemory = block;
+        entry.memoryInjected = true;
+        entry.injectedProjectId = effectiveProjectId;
+        const rec = store.readRecord(sessionId);
+        if (rec) { rec.lastMemoryInjection = { charCount: block.length, at: Date.now() }; store.writeRecord(rec); }
+      }
+    } catch {}
+    try {
+      entry.busy = true; // in-flight turn — exempt from LRU eviction
+      const result = await entry.client.sendPrompt(entry.cliSessionId, prompt);
+      flushAssistant(sessionId); // turn complete -> persist the full assistant msg
+      return result;
+    } catch (err) {
+      flushAssistant(sessionId); // persist whatever completed before the error
+      throw err;
+    } finally {
+      const e = sessionClients.get(sessionId);
+      if (e) { e.busy = false; e.lastUsedAt = Date.now(); }
+    }
   });
 
-  ipcMain.handle('acp:cancel', async (_event, sessionId: string, model: string) => {
-    const client = clients.get(model || DEFAULT_MODEL);
-    if (!client) return;
-    return client.cancelPrompt(sessionId);
+  ipcMain.handle('acp:cancel', async (_event, sessionId: string) => {
+    const entry = sessionClients.get(sessionId);
+    if (!entry) return;
+    return entry.client.cancelPrompt(entry.cliSessionId);
   });
 
   ipcMain.handle('acp:delete-session', async (_event, sessionId: string) => {
+    // Kill this chat's executor first (frees a slot, stops the kiro-cli process)
+    // so deleting a chat never leaves an orphaned process running.
+    detachExecutor(sessionId);
     // Delete session directory from disk
     const sessionDir = path.join(sessionsBaseDir, sessionId);
     if (fs.existsSync(sessionDir)) {
       fs.rmSync(sessionDir, { recursive: true, force: true });
     }
+    // Also delete this chat's session-specific memory.
+    deleteSessionMemory(sessionId);
     // Also check if any directory in sessionsBaseDir contains this sessionId
     if (fs.existsSync(sessionsBaseDir)) {
       const dirs = fs.readdirSync(sessionsBaseDir);
@@ -470,26 +638,143 @@ app.whenReady().then(() => {
   });
 
   ipcMain.handle('acp:load-session', async (_event, sessionId: string, cwd: string, model: string) => {
-    const client = await getClient(model);
     const resolvedCwd = cwd === '~' ? os.homedir() : cwd;
-    return client.loadSession(sessionId, resolvedCwd);
+    let entry = sessionClients.get(sessionId);
+    if (!entry) {
+      if (!ensureExecutorCapacity(sessionId)) {
+        throw new Error('All live sessions are busy; cannot attach another right now.');
+      }
+      const existing = store.readRecord(sessionId);
+      const derived = resolvedCwd === os.homedir() ? undefined : deriveProjectId(resolvedCwd);
+      const projectId = existing?.profile.projectId ?? derived;
+      const profile: AgentProfile = { model: model || DEFAULT_MODEL, projectId };
+      const client = new AcpClient(profile.model, shellEnv);
+      await client.connect();
+      // Resume the mapped kiro-cli session; fall back to id (legacy records where
+      // KiroLex id WAS the cli id), and to a fresh session if resume fails.
+      let cliSessionId = existing?.cliSessionId || sessionId;
+      try {
+        await client.loadSession(cliSessionId, resolvedCwd);
+      } catch {
+        const created = await client.newSession(resolvedCwd);
+        cliSessionId = created.sessionId;
+      }
+      entry = { client, cliSessionId, profile, assistantBuf: '', assistantMsgId: null, memoryInjected: false, lastUsedAt: Date.now() };
+      sessionClients.set(sessionId, entry);
+      wireSession(sessionId, entry);
+      const rec = store.readRecord(sessionId) || store.createSession(sessionId, profile);
+      rec.cliSessionId = cliSessionId;
+      rec.executorState = 'attached';
+      store.writeRecord(rec);
+      mainWindow?.webContents.send('session:ready-for-first-prompt', { sessionId, projectId: profile.projectId });
+    }
+    return { ok: true };
   });
 
-  ipcMain.handle('acp:request-permission-response', async (_event, requestId: number, granted: boolean, model: string) => {
-    const client = clients.get(model || DEFAULT_MODEL);
-    if (!client) throw new Error('Not connected');
-    return client.respondToPermission(requestId, granted);
+  ipcMain.handle('acp:request-permission-response', async (_event, requestId: number, granted: boolean, sessionId: string) => {
+    const entry = sessionClients.get(sessionId);
+    if (!entry) throw new Error('Session not connected');
+    return entry.client.respondToPermission(requestId, granted);
+  });
+
+  // Write-once project assignment (design §6.4). Allowed only for the
+  // null/undefined -> concrete transition; project->project or un-set is
+  // rejected. Persists to the durable record and syncs any live executor.
+  ipcMain.handle('acp:assign-project', async (_event, sessionId: string, projectId: string) => {
+    const rec = store.readRecord(sessionId);
+    if (!rec) throw new Error('No such session');
+    if (!canAssignProjectId(rec.profile.projectId, projectId)) {
+      throw new Error('projectId is write-once; it cannot be changed once set.');
+    }
+    rec.profile.projectId = projectId;
+    store.writeRecord(rec);
+    const entry = sessionClients.get(sessionId);
+    if (entry) entry.profile.projectId = projectId; // keep live executor in sync
+    return { sessionId, projectId };
+  });
+
+  // Project-level force set/clear (used by rename/delete PROJECT, an explicit
+  // admin operation). Unlike acp:assign-project this bypasses the write-once
+  // check on purpose; per-session Assign still goes through the checked path.
+  ipcMain.handle('acp:set-project', async (_event, sessionId: string, projectId: string | null) => {
+    const rec = store.readRecord(sessionId);
+    if (!rec) return { sessionId, projectId };
+    rec.profile.projectId = projectId ?? undefined;
+    store.writeRecord(rec);
+    const entry = sessionClients.get(sessionId);
+    if (entry) entry.profile.projectId = projectId ?? undefined;
+    return { sessionId, projectId };
+  });
+
+  // Move a session to another project (or unassign with null) WITH an executor
+  // reset. Changing the project changes the injected memory scope; a live
+  // executor already has the OLD project's memory in its context. We detach it
+  // so a fresh executor attaches on next use, re-injecting ONLY the new scope's
+  // memory (old injection state is discarded with the entry). The durable
+  // transcript + memory are untouched; the backend session resumes on re-attach,
+  // so the conversation is preserved. Unlike assign-project this is not
+  // write-once — it is an explicit user move.
+  ipcMain.handle('acp:move-session', async (_event, sessionId: string, projectId: string | null) => {
+    const rec = store.readRecord(sessionId);
+    if (rec) {
+      rec.profile.projectId = projectId ?? undefined;
+      rec.archived = false; // moving a chat brings it out of the archive
+      store.writeRecord(rec);
+    }
+    detachExecutor(sessionId); // executor reset -> fresh memory scope on re-attach
+    return { sessionId, projectId: projectId ?? null };
+  });
+
+  // Expose the auto-sized executor cap so the renderer warms the right number
+  // of sessions at startup (instead of a hardcoded count).
+  ipcMain.handle('acp:get-executor-cap', async () => MAX_CONCURRENT_SESSIONS);
+
+  // Archive / unarchive a session. Archiving hides it from the main list and
+  // frees its executor slot (a later unarchive/open re-attaches transparently);
+  // the durable transcript + memory are untouched. Not a delete.
+  ipcMain.handle('acp:archive-session', async (_event, sessionId: string, archived: boolean) => {
+    const rec = store.readRecord(sessionId);
+    if (rec) {
+      rec.archived = !!archived;
+      // Archiving detaches the chat from its project: it carries no project
+      // memory while archived, and unarchive returns it to the Unassigned bucket.
+      if (archived) rec.profile.projectId = undefined;
+      store.writeRecord(rec);
+    }
+    if (archived) detachExecutor(sessionId); // give the warm slot back
+    return { sessionId, archived: !!archived };
+  });
+
+  // Delete a project's memory directory (project deletion).
+  ipcMain.handle('acp:delete-project-memory', async (_event, projectId: string) => {
+    deleteProjectMemory(projectId);
+    return { projectId };
+  });
+
+  // Memory editor UI: read/write layered memory.
+  // Authoritative transcript read (design §4): the durable, uncapped,
+  // per-KiroLex-id record. Used by cross-session context sync so it works for
+  // chats beyond the renderer's 20-session cache and survives restart.
+  ipcMain.handle('acp:read-transcript', async (_event, sessionId: string) => {
+    return store.readTranscript(sessionId);
+  });
+
+  ipcMain.handle('acp:read-memory', async (_event, projectId?: string, sessionId?: string) => {
+    return readMemory(projectId, sessionId);
+  });
+  ipcMain.handle('acp:write-memory', async (_event, scope: 'global' | 'project' | 'session', projectId: string | undefined, sessionId: string | undefined, content: string) => {
+    writeMemory(scope, projectId, sessionId, content);
+    return { ok: true };
   });
 });
 
 app.on('before-quit', () => {
   isQuitting = true;
-  // Kill all kiro-cli child processes so none are orphaned
-  for (const [, client] of clients) {
-    try { client.disconnect(); } catch {}
+  // Kill all per-session kiro-cli child processes so none are orphaned
+  for (const [, entry] of sessionClients) {
+    try { entry.client.disconnect(); } catch {}
   }
-  clients.clear();
-  connectingClients.clear();
+  sessionClients.clear();
 });
 
 app.on('window-all-closed', () => {

@@ -51,9 +51,7 @@ const MessageItem = memo<{
   msg: Message;
   isLastAssistant: boolean;
   isStreaming: boolean;
-  isLooping: boolean;
-  onLoopSetup: (text: string) => void;
-}>(({ msg, isLastAssistant, isStreaming, isLooping, onLoopSetup }) => (
+}>(({ msg, isLastAssistant, isStreaming }) => (
   <div className={`message ${msg.role}`}>
     <div className="message-content">
       {msg.role === 'user' ? (
@@ -86,17 +84,6 @@ const MessageItem = memo<{
         ))}
       </div>
     )}
-    {msg.role === 'user' && !isLooping && msg.content.trim() && (
-      <div className="loop-this-row">
-        <button
-          className="loop-this-btn"
-          onClick={() => onLoopSetup(msg.content)}
-          title="Repeatedly re-send this prompt"
-        >
-          🔁 loop this prompt
-        </button>
-      </div>
-    )}
   </div>
 ));
 
@@ -104,15 +91,13 @@ const MessageItem = memo<{
 // re-renders due to streaming chunks. This is the primary fix for input lag.
 const ChatInputBox = memo<{
   isStreaming: boolean;
-  isLooping: boolean;
   status: 'disconnected' | 'connecting' | 'connected';
   onSend: (text: string) => void;
   onCancel: () => void;
   onQueueCommand: (text: string) => void;
-  onStopLoop: () => void;
   onDropFiles: (files: AttachedFile[]) => void;
   attachedFiles: AttachedFile[];
-}>(({ isStreaming, isLooping, status, onSend, onCancel, onQueueCommand, onStopLoop, onDropFiles, attachedFiles }) => {
+}>(({ isStreaming, status, onSend, onCancel, onQueueCommand, onDropFiles, attachedFiles }) => {
   const [input, setInput] = useState('');
   const [isComposing, setIsComposing] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -168,9 +153,7 @@ const ChatInputBox = memo<{
         ref={textareaRef}
         className="chat-input"
         placeholder={
-          isLooping
-            ? 'looping prompt, click button to stop'
-            : status !== 'connected'
+          status !== 'connected'
             ? 'Connecting... (type /stop to force reconnect)'
             : isStreaming
             ? 'Generating... (type /stop to force interrupt)'
@@ -182,14 +165,13 @@ const ChatInputBox = memo<{
         onPaste={handlePaste}
         onCompositionStart={() => setIsComposing(true)}
         onCompositionEnd={() => setIsComposing(false)}
-        disabled={isLooping}
         rows={3}
       />
-      {(isStreaming || isLooping) && (
+      {isStreaming && (
         <button
           className="stop-btn"
-          onClick={isLooping ? onStopLoop : onCancel}
-          title={isLooping ? 'Stop loop' : 'Stop'}
+          onClick={onCancel}
+          title="Stop"
         >
           <span className="stop-btn-square"></span>
         </button>
@@ -214,15 +196,14 @@ interface ChatAreaProps {
   onDropFiles: (files: AttachedFile[]) => void;
   onRemoveFile: (id: string) => void;
   currentSessionId: string | null;
+  isArchived?: boolean;
+  onUnarchive?: () => void;
   commandQueue: string[];
   onQueueCommand: (text: string) => void;
   onRemoveQueuedCommand: (index: number) => void;
   importableSessions: { id: string; title: string }[];
   contextLinks: { sourceId: string; sourceTitle: string }[];
   onToggleContextSource: (sourceSessionId: string) => void;
-  isLooping: boolean;
-  onStartLoop: (text: string, intervalSec: number) => void;
-  onStopLoop: () => void;
 }
 
 export const ChatArea: React.FC<ChatAreaProps> = ({
@@ -241,20 +222,17 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   onDropFiles,
   onRemoveFile,
   currentSessionId,
+  isArchived,
+  onUnarchive,
   commandQueue,
   onQueueCommand,
   onRemoveQueuedCommand,
   importableSessions,
   contextLinks,
   onToggleContextSource,
-  isLooping,
-  onStartLoop,
-  onStopLoop,
 }) => {
   const [isDragOver, setIsDragOver] = useState(false);
   const [showQueue, setShowQueue] = useState(false);
-  const [loopSetup, setLoopSetup] = useState<{ text: string } | null>(null);
-  const [loopSeconds, setLoopSeconds] = useState('');
   const [showImportPicker, setShowImportPicker] = useState(false);
   const [pickerPos, setPickerPos] = useState<{ left: number; bottom: number }>({ left: 0, bottom: 0 });
   const importBtnRef = useRef<HTMLButtonElement>(null);
@@ -431,8 +409,6 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             msg={msg}
             isLastAssistant={msg.role === 'assistant' && idx === messages.length - 1}
             isStreaming={isStreaming}
-            isLooping={isLooping}
-            onLoopSetup={(text) => { setLoopSeconds(''); setLoopSetup({ text }); }}
           />
         ))}
 
@@ -489,17 +465,24 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
         </div>
         )}
         <div className="chat-input-area" style={{ height: inputHeight }}>
+        {isArchived ? (
+          <div className="archived-composer-banner">
+            <span>📥 This chat is archived — unarchive it to continue chatting.</span>
+            {onUnarchive && (
+              <button className="archived-unarchive-btn" onClick={onUnarchive}>♻️ Unarchive</button>
+            )}
+          </div>
+        ) : (
         <ChatInputBox
           isStreaming={isStreaming}
-          isLooping={isLooping}
           status={status}
           onSend={onSend}
           onCancel={onCancel}
           onQueueCommand={onQueueCommand}
-          onStopLoop={onStopLoop}
           onDropFiles={onDropFiles}
           attachedFiles={attachedFiles}
         />
+        )}
         {/* Model selector and tool status below input */}
         <div className="input-model-row">
           <div className="input-model-left">
@@ -615,42 +598,6 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
         </div>
       </div>
       </>
-      )}
-      {loopSetup && (
-        <>
-          <div className="overlay" onClick={() => setLoopSetup(null)} />
-          <div className="loop-dialog">
-            <h3>🔁 Loop this prompt</h3>
-            <div className="loop-dialog-preview">{loopSetup.text}</div>
-            <label className="loop-dialog-field">
-              <span>Interval in seconds (0 = repeat immediately after each response)</span>
-              <input
-                type="text"
-                inputMode="numeric"
-                placeholder="0"
-                autoFocus
-                value={loopSeconds}
-                onChange={(e) => setLoopSeconds(e.target.value.replace(/[^0-9]/g, ''))}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') {
-                    onStartLoop(loopSetup.text, parseInt(loopSeconds, 10) || 0);
-                    setLoopSetup(null);
-                  } else if (e.key === 'Escape') {
-                    setLoopSetup(null);
-                  }
-                }}
-              />
-            </label>
-            <div className="loop-dialog-actions">
-              <button
-                className="loop-dialog-start"
-                onClick={() => { onStartLoop(loopSetup.text, parseInt(loopSeconds, 10) || 0); setLoopSetup(null); }}
-              >
-                Start Loop
-              </button>
-            </div>
-          </div>
-        </>
       )}
     </div>
   );

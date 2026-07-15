@@ -3,6 +3,7 @@ import { Sidebar } from './components/Sidebar';
 import { ChatArea } from './components/ChatArea';
 import { PermissionDialog } from './components/PermissionDialog';
 import { SettingsDialog } from './components/SettingsDialog';
+import { MemoryDialog } from './components/MemoryDialog';
 import { useAcp } from './hooks/useAcp';
 
 declare global {
@@ -10,13 +11,24 @@ declare global {
     kiroApi: {
       connect: (options: { model?: string }) => Promise<any>;
       disconnect: () => Promise<void>;
-      newSession: (cwd: string, model: string) => Promise<{ sessionId: string }>;
+      newSession: (kiroLexId: string, cwd: string, model: string, projectId?: string) => Promise<{ sessionId: string }>;
       loadSession: (sessionId: string, cwd: string, model: string) => Promise<any>;
+      readTranscript: (sessionId: string) => Promise<{ id: string; role: 'user' | 'assistant'; content: string; ts: number }[]>;
       listSessions: () => Promise<any>;
       deleteSession: (sessionId: string) => Promise<void>;
-      prompt: (sessionId: string, prompt: any[], model: string) => Promise<any>;
+      assignProject: (sessionId: string, projectId: string) => Promise<{ sessionId: string; projectId: string }>;
+      setProject: (sessionId: string, projectId: string | null) => Promise<{ sessionId: string; projectId: string | null }>;
+      moveSession: (sessionId: string, projectId: string | null) => Promise<{ sessionId: string; projectId: string | null }>;
+      archiveSession: (sessionId: string, archived: boolean) => Promise<{ sessionId: string; archived: boolean }>;
+      getExecutorCap: () => Promise<number>;
+      reveal: () => Promise<{ revealed: boolean }>;
+      splashStatus: (text: string) => Promise<{ ok: boolean }>;
+      deleteProjectMemory: (projectId: string) => Promise<{ projectId: string }>;
+      readMemory: (projectId?: string, sessionId?: string) => Promise<{ global: string; project: string; session: string; projectId: string | null; sessionId: string | null; globalPath: string; projectPath: string | null; sessionPath: string | null }>;
+      writeMemory: (scope: 'global' | 'project' | 'session', projectId: string | undefined, sessionId: string | undefined, content: string) => Promise<{ ok: boolean }>;
+      prompt: (sessionId: string, prompt: any[], model: string, projectId?: string) => Promise<any>;
       cancel: (sessionId: string, model: string) => Promise<void>;
-      respondPermission: (requestId: number, granted: boolean, model: string) => Promise<void>;
+      respondPermission: (requestId: number, granted: boolean, sessionId: string) => Promise<void>;
       listModels: () => Promise<any>;
       getUsage: () => Promise<{ text: string }>;
       getHomeDir: () => Promise<string>;
@@ -24,6 +36,7 @@ declare global {
       onUpdate: (callback: (data: any) => void) => () => void;
       onError: (callback: (error: any) => void) => () => void;
       onDisconnected: (callback: (data?: any) => void) => () => void;
+      onSessionReady: (callback: (data: { sessionId: string; projectId?: string }) => void) => () => void;
     };
   }
 }
@@ -56,7 +69,13 @@ export interface Session {
   id: string;
   title: string;
   model: string;
-  folderId?: string | null; // null or undefined = root level
+  /** Write-once memory-scoping label (design §4/§6.4). Undefined = unassigned. */
+  projectId?: string;
+  /** Pinned sessions sort to the top of their group. */
+  pinned?: boolean;
+  /** User-archived: hidden from the main list into a collapsible Archived group. */
+  archived?: boolean;
+  folderId?: string | null; // legacy — retained for back-compat, no longer surfaced
   lastMessage?: string;
   timestamp: number;
 }
@@ -100,6 +119,8 @@ const App: React.FC = () => {
     messages,
     isStreaming,
     streamingIds,
+    attachedSessionIds,
+    connectingSessionIds,
     activeToolCall,
     usage,
     permissionRequest,
@@ -107,36 +128,45 @@ const App: React.FC = () => {
     disconnect,
     forceStop,
     newSession,
-    duplicateSession,
     switchSession,
     deleteSession,
     renameSession,
-    reorderSessions,
-    folders,
-    createFolder,
-    deleteFolder,
-    renameFolder,
-    toggleFolder,
-    moveSessionToFolder,
     changeSessionModel,
+    assignProject,
+    moveSession,
+    archiveSession,
+    projects,
+    createProject,
+    renameProject,
+    deleteProject,
+    togglePin,
+    clearConversation,
     sendMessage,
     cancelStream,
     respondPermission,
     contextLinks,
     toggleContextSource,
-    loopingIds,
-    startLoop,
-    stopLoop,
   } = useAcp();
 
   const [attachedFiles, setAttachedFiles] = useState<AttachedFile[]>([]);
   const [selectedModel, setSelectedModel] = useState('claude-opus-4.6');
   const [models, setModels] = useState<any[]>([]);
   const [showSettings, setShowSettings] = useState(false);
+  const [showMemory, setShowMemory] = useState(false);
   const [settings, setSettings] = useState<Settings>(loadSettings);
   const [homeDir, setHomeDir] = useState('~');
   const [deleteConfirm, setDeleteConfirm] = useState<{ sessionId: string; title: string } | null>(null);
+  const [deleteProjectConfirm, setDeleteProjectConfirm] = useState<{ name: string; memberCount: number } | null>(null);
   const [unreadSessionIds, setUnreadSessionIds] = useState<string[]>([]);
+  // "Don't ask again" for delete confirmation (persisted).
+  const [skipDeleteConfirm, setSkipDeleteConfirm] = useState<boolean>(() => {
+    try { return localStorage.getItem('kirolex-skip-delete-confirm') === 'true'; } catch { return false; }
+  });
+  const [dontAskDelete, setDontAskDelete] = useState(false);
+  // New Chat dialog: choose project at creation.
+  const [showNewChat, setShowNewChat] = useState(false);
+  const [newChatProject, setNewChatProject] = useState<string>(''); // '' = none, '__new__' = create
+  const [newChatNewProjectName, setNewChatNewProjectName] = useState('');
 
   // Mark sessions as unread when they finish streaming and the user isn't viewing them
   const prevStreamingIdsRef = useRef<string[]>([]);
@@ -145,12 +175,12 @@ const App: React.FC = () => {
     // Sessions that were streaming before but aren't now = just finished
     const finished = prev.filter((id) => !streamingIds.includes(id));
     for (const fid of finished) {
-      if (fid !== currentSessionId && !loopingIds.includes(fid)) {
+      if (fid !== currentSessionId) {
         setUnreadSessionIds((u) => (u.includes(fid) ? u : [...u, fid]));
       }
     }
     prevStreamingIdsRef.current = streamingIds;
-  }, [streamingIds, currentSessionId, loopingIds]);
+  }, [streamingIds, currentSessionId]);
 
   // Clear unread when user switches to a session
   const handleSwitchSession = useCallback((sessionId: string) => {
@@ -159,22 +189,59 @@ const App: React.FC = () => {
   }, [switchSession]);
 
   const handleDeleteSession = useCallback((sessionId: string) => {
+    // Read the persisted flag live (single source of truth, written by both the
+    // Settings toggle and the dialog's "Don't ask again") to avoid any stale
+    // closure of skipDeleteConfirm.
+    let skip = skipDeleteConfirm;
+    try { skip = localStorage.getItem('kirolex-skip-delete-confirm') === 'true'; } catch {}
+    if (skip) { deleteSession(sessionId); return; }
     const session = sessions.find((s) => s.id === sessionId);
     setDeleteConfirm({ sessionId, title: session?.title || 'this session' });
-  }, [sessions]);
+  }, [sessions, skipDeleteConfirm, deleteSession]);
 
-  // Duplicate a session and immediately open the copy so the user can continue.
-  const handleDuplicateSession = useCallback((sessionId: string) => {
-    const newId = duplicateSession(sessionId);
-    if (newId) handleSwitchSession(newId);
-  }, [duplicateSession, handleSwitchSession]);
+  // Create a new chat directly inside a project (created already assigned).
+  const handleNewSessionInProject = useCallback((project: string) => {
+    newSession(homeDir, selectedModel, project);
+  }, [newSession, homeDir, selectedModel]);
+
+  // Create a chat from the New Chat dialog, assigning the chosen project (if any)
+  // at creation.
+  const handleCreateChat = useCallback(() => {
+    const proj = newChatProject === '__new__'
+      ? (newChatNewProjectName.trim() || undefined)
+      : (newChatProject || undefined);
+    newSession(homeDir, selectedModel, proj);
+    setShowNewChat(false);
+    setNewChatProject('');
+    setNewChatNewProjectName('');
+  }, [newChatProject, newChatNewProjectName, newSession, homeDir, selectedModel]);
 
   const confirmDelete = useCallback(() => {
     if (deleteConfirm) {
+      if (dontAskDelete) {
+        setSkipDeleteConfirm(true);
+        try { localStorage.setItem('kirolex-skip-delete-confirm', 'true'); } catch {}
+      }
       deleteSession(deleteConfirm.sessionId);
       setDeleteConfirm(null);
+      setDontAskDelete(false);
     }
-  }, [deleteConfirm, deleteSession]);
+  }, [deleteConfirm, deleteSession, dontAskDelete]);
+
+  // Project deletion is destructive (removes every member chat + the project's
+  // memory) and ALWAYS confirms — deliberately independent of the chat-delete
+  // "Don't ask again" / Settings toggle.
+  const handleDeleteProject = useCallback((name: string) => {
+    const memberCount = sessions.filter((s) => s.projectId === name).length;
+    setDeleteProjectConfirm({ name, memberCount });
+  }, [sessions]);
+
+  const confirmDeleteProject = useCallback(() => {
+    if (deleteProjectConfirm) {
+      deleteProject(deleteProjectConfirm.name);
+      setDeleteProjectConfirm(null);
+    }
+  }, [deleteProjectConfirm, deleteProject]);
 
   useEffect(() => {
     if (window.kiroApi) {
@@ -246,6 +313,14 @@ const App: React.FC = () => {
     if (text.trim() === '/stop') {
       await forceStop(selectedModel);
       sendMessage([{ type: 'text', text: '/stop' }], '🔄 Force interrupted and reconnected.');
+      return;
+    }
+
+    // Handle /clear: wipe the visible history + cache, then forward /clear so
+    // the backend also resets its context.
+    if (text.trim() === '/clear') {
+      clearConversation(currentSessionId);
+      await sendMessage([{ type: 'text', text: '/clear' }]);
       return;
     }
 
@@ -361,23 +436,27 @@ const App: React.FC = () => {
           <div style={{ width: sidebarWidth, flexShrink: 0 }}>
             <Sidebar
               sessions={sessions}
-              folders={folders}
+              projects={projects}
               currentSessionId={currentSessionId}
               status={status}
               streamingSessionIds={streamingIds}
+              attachedSessionIds={attachedSessionIds}
+              connectingSessionIds={connectingSessionIds}
               unreadSessionIds={unreadSessionIds}
-              onNewSession={() => newSession(homeDir, selectedModel)}
+              onNewSession={() => { setNewChatProject(''); setNewChatNewProjectName(''); setShowNewChat(true); }}
+              onCreateProject={createProject}
+              onNewSessionInProject={handleNewSessionInProject}
+              onRenameProject={renameProject}
+              onDeleteProject={handleDeleteProject}
               onSwitchSession={handleSwitchSession}
               onDeleteSession={handleDeleteSession}
-              onDuplicateSession={handleDuplicateSession}
               onRenameSession={renameSession}
-              onReorderSessions={reorderSessions}
-              onCreateFolder={createFolder}
-              onDeleteFolder={deleteFolder}
-              onRenameFolder={renameFolder}
-              onToggleFolder={toggleFolder}
-              onMoveSessionToFolder={moveSessionToFolder}
+              onTogglePin={togglePin}
+              onAssignProject={assignProject}
+              onMoveSession={moveSession}
+              onArchiveSession={archiveSession}
               onSettings={() => setShowSettings(true)}
+              onOpenMemory={() => setShowMemory(true)}
             />
           </div>
         )}
@@ -409,21 +488,16 @@ const App: React.FC = () => {
           onDropFiles={handleDropFiles}
           onRemoveFile={handleRemoveFile}
           currentSessionId={currentSessionId}
+          isArchived={!!sessions.find((s) => s.id === currentSessionId)?.archived}
+          onUnarchive={() => { if (currentSessionId) archiveSession(currentSessionId, false); }}
           commandQueue={commandQueue}
           onQueueCommand={handleQueueCommand}
           onRemoveQueuedCommand={handleRemoveQueuedCommand}
           importableSessions={sessions
-            .filter((s) => s.id !== currentSessionId && !s.id.startsWith('pending_'))
+            .filter((s) => s.id !== currentSessionId && !s.id.startsWith('pending_') && !s.archived)
             .map((s) => ({ id: s.id, title: s.title }))}
           contextLinks={contextLinks}
           onToggleContextSource={toggleContextSource}
-          isLooping={currentSessionId !== null && loopingIds.includes(currentSessionId)}
-          onStartLoop={(text, intervalSec) => {
-            if (currentSessionId) startLoop(currentSessionId, text, intervalSec);
-          }}
-          onStopLoop={() => {
-            if (currentSessionId) stopLoop(currentSessionId);
-          }}
         />
       </div>
       {permissionRequest && (
@@ -437,6 +511,56 @@ const App: React.FC = () => {
           settings={settings}
           onChange={handleSettingsChange}
           onClose={() => setShowSettings(false)}
+          confirmDeletes={!skipDeleteConfirm}
+          onConfirmDeletesChange={(value) => {
+            const skip = !value;
+            setSkipDeleteConfirm(skip);
+            try { localStorage.setItem('kirolex-skip-delete-confirm', String(skip)); } catch {}
+          }}
+        />
+      )}
+      {showNewChat && (
+        <>
+          <div className="overlay" onClick={() => setShowNewChat(false)} />
+          <div className="permission-dialog">
+            <h3>💬 New Chat</h3>
+            <p style={{ marginBottom: 10 }}>Assign this chat to a project (optional). A project gives the chat its own memory.</p>
+            <label style={{ display: 'block', fontSize: 12, color: 'var(--text-muted)', marginBottom: 4 }}>Project</label>
+            <select
+              className="rename-popup-input"
+              value={newChatProject}
+              onChange={(e) => setNewChatProject(e.target.value)}
+              style={{ marginBottom: 12 }}
+            >
+              <option value="">No project (unassigned)</option>
+              {projects.map((p) => (
+                <option key={p} value={p}>{p}</option>
+              ))}
+              <option value="__new__">+ New project…</option>
+            </select>
+            {newChatProject === '__new__' && (
+              <input
+                autoFocus
+                className="rename-popup-input"
+                placeholder="New project name…"
+                value={newChatNewProjectName}
+                onChange={(e) => setNewChatNewProjectName(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') handleCreateChat(); }}
+                style={{ marginBottom: 12 }}
+              />
+            )}
+            <div className="actions">
+              <button className="btn deny" onClick={() => setShowNewChat(false)}>Cancel</button>
+              <button className="btn allow" onClick={handleCreateChat}>Create</button>
+            </div>
+          </div>
+        </>
+      )}
+      {showMemory && (
+        <MemoryDialog
+          projectId={sessions.find((s) => s.id === currentSessionId)?.projectId}
+          sessionId={currentSessionId && !currentSessionId.startsWith('pending_') ? currentSessionId : undefined}
+          onClose={() => setShowMemory(false)}
         />
       )}
       {deleteConfirm && (
@@ -448,12 +572,42 @@ const App: React.FC = () => {
               Are you sure you want to delete <strong>"{deleteConfirm.title}"</strong>?
               This will permanently remove the session and its history.
             </p>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: 'var(--text-secondary)', margin: '4px 0 14px', cursor: 'pointer' }}>
+              <input
+                type="checkbox"
+                checked={dontAskDelete}
+                onChange={(e) => setDontAskDelete(e.target.checked)}
+              />
+              Don't ask again
+            </label>
             <div className="actions">
-              <button className="btn deny" onClick={() => setDeleteConfirm(null)}>
+              <button className="btn deny" onClick={() => { setDeleteConfirm(null); setDontAskDelete(false); }}>
                 Cancel
               </button>
               <button className="btn allow" onClick={confirmDelete} style={{ background: '#ef5350' }}>
                 Delete
+              </button>
+            </div>
+          </div>
+        </>
+      )}
+      {deleteProjectConfirm && (
+        <>
+          <div className="overlay" onClick={() => setDeleteProjectConfirm(null)} />
+          <div className="permission-dialog">
+            <h3>🗑️ Delete Project</h3>
+            <p>
+              Are you sure you want to delete the project <strong>"{deleteProjectConfirm.name}"</strong>?
+              This permanently removes its memory{deleteProjectConfirm.memberCount > 0
+                ? <> and <strong>{deleteProjectConfirm.memberCount} chat{deleteProjectConfirm.memberCount === 1 ? '' : 's'}</strong> inside it (with their history)</>
+                : null}. This cannot be undone.
+            </p>
+            <div className="actions">
+              <button className="btn deny" onClick={() => setDeleteProjectConfirm(null)}>
+                Cancel
+              </button>
+              <button className="btn allow" onClick={confirmDeleteProject} style={{ background: '#ef5350' }}>
+                Delete project
               </button>
             </div>
           </div>

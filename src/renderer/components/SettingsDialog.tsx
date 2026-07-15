@@ -5,12 +5,16 @@ interface SettingsDialogProps {
   settings: Settings;
   onChange: (settings: Settings) => void;
   onClose: () => void;
+  confirmDeletes: boolean;
+  onConfirmDeletesChange: (value: boolean) => void;
 }
 
 export const SettingsDialog: React.FC<SettingsDialogProps> = ({
   settings,
   onChange,
   onClose,
+  confirmDeletes,
+  onConfirmDeletesChange,
 }) => {
   return (
     <>
@@ -38,6 +42,20 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
               >
                 +
               </button>
+            </div>
+          </div>
+
+          <div className="settings-item">
+            <label className="settings-label">Confirm before deleting chats</label>
+            <div className="settings-control">
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  checked={confirmDeletes}
+                  onChange={(e) => onConfirmDeletesChange(e.target.checked)}
+                />
+                <span className="settings-value">{confirmDeletes ? 'On' : 'Off'}</span>
+              </label>
             </div>
           </div>
 

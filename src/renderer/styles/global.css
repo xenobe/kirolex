@@ -191,6 +191,84 @@ html, body, #root {
   background: var(--accent-hover);
 }
 
+/* Secondary "New Project" button, sits beside New Session */
+.new-project-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 9px 12px;
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+  transition: background 0.2s, color 0.2s;
+}
+
+.new-project-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+/* Pin marker on a pinned session row */
+.session-pin {
+  font-size: 9px;
+  flex-shrink: 0;
+  opacity: 0.8;
+}
+
+/* Floating drag overlay (follows the cursor while dragging a session) */
+.drag-overlay-item {
+  background: var(--bg-secondary);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  cursor: grabbing;
+  width: 210px;
+  color: var(--text-primary);
+}
+
+/* Memory editor dialog */
+.memory-tab {
+  padding: 6px 12px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  border-radius: 6px 6px 0 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+.memory-tab.active {
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  border-bottom-color: transparent;
+}
+.memory-tab:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.memory-textarea {
+  width: 100%;
+  min-height: 220px;
+  resize: vertical;
+  padding: 10px 12px;
+  background: var(--input-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-primary);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  outline: none;
+}
+.memory-textarea:focus {
+  border-color: var(--accent);
+}
+
 .sidebar-top-btns {
   display: flex;
   gap: 6px;
@@ -367,8 +445,16 @@ html, body, #root {
   width: 5px;
   height: 5px;
   border-radius: 50%;
-  background: var(--accent);
+  background: #3fb950;
   flex-shrink: 0;
+}
+
+/* Live (attached executor, idle) — clear green "on" light */
+.session-item .session-dot.idle {
+  width: 7px;
+  height: 7px;
+  background: #3fb950;
+  box-shadow: 0 0 5px rgba(63, 185, 80, 0.7);
 }
 
 .session-item .session-dot.streaming {
@@ -385,7 +471,7 @@ html, body, #root {
   width: 3px;
   height: 3px;
   border-radius: 50%;
-  background: var(--accent);
+  background: #3fb950;
   animation: dotBounce 1.2s ease-in-out infinite;
 }
 
@@ -405,8 +491,144 @@ html, body, #root {
 .session-item .session-dot.unread {
   width: 8px;
   height: 8px;
-  background: var(--accent);
-  box-shadow: 0 0 4px var(--accent);
+  background: #3fb950;
+  box-shadow: 0 0 0 2px rgba(63, 185, 80, 0.3), 0 0 6px #3fb950;
+}
+
+/* Dormant = archived / deliberately inert (neutral, not an alert). */
+.session-item .session-dot.dormant {
+  width: 6px;
+  height: 6px;
+  background: transparent;
+  border: 1px solid var(--text-muted);
+  opacity: 0.6;
+}
+
+/* Warm = attached executor but not the focused chat: alive/ready, calm. */
+.session-item .session-dot.warm {
+  width: 6px;
+  height: 6px;
+  background: #3fb950;
+  opacity: 0.55;
+}
+
+/* Alert = no live executor (and not archived): not warmed up, select to activate. */
+.session-item .session-dot.alert {
+  width: 7px;
+  height: 7px;
+  background: #f0883e;
+  box-shadow: 0 0 0 2px rgba(240, 136, 62, 0.25);
+}
+
+/* Connecting = executor attaching (spawn/connect in flight) — flashing dot */
+.session-item .session-dot.connecting {
+  width: 7px;
+  height: 7px;
+  background: #f0b429;
+  box-shadow: 0 0 5px #f0b429;
+  animation: dotFlash 0.8s ease-in-out infinite;
+}
+
+@keyframes dotFlash {
+  0%, 100% { opacity: 0.25; transform: scale(0.7); }
+  50% { opacity: 1; transform: scale(1.05); }
+}
+
+/* Write-once project label chip (design §4/§6.4) */
+.session-project-chip {
+  flex-shrink: 0;
+  max-width: 90px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  color: var(--text-muted);
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  padding: 1px 6px;
+  border-radius: 8px;
+  margin-left: 4px;
+}
+
+/* Project grouping (root sessions) */
+.project-group {
+  margin-bottom: 2px;
+}
+
+.project-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text-secondary);
+  font-weight: 500;
+  transition: background 0.15s;
+}
+
+.project-header:hover {
+  background: var(--bg-hover);
+}
+
+.pg-icon {
+  flex-shrink: 0;
+  color: var(--text-muted);
+}
+
+.project-count {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--text-muted);
+  min-width: 12px;
+  text-align: right;
+}
+
+.project-action-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  border-radius: 4px;
+  opacity: 0;
+  transition: opacity 0.15s, background 0.15s, color 0.15s;
+}
+
+.project-header:hover .project-action-btn {
+  opacity: 1;
+}
+
+.project-action-btn:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+/* "New chat in project" child row */
+.project-newchat {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text-muted);
+  transition: background 0.15s, color 0.15s;
+}
+
+.project-newchat:hover {
+  background: var(--bg-hover);
+  color: var(--text-secondary);
+}
+
+.project-icon {
+  font-size: 10px;
+  flex-shrink: 0;
 }
 
 .session-delete-btn {
@@ -504,6 +726,13 @@ html, body, #root {
   padding: 4px 6px;
   border-radius: 4px;
   transition: background 0.15s;
+}
+
+/* Only the first status-bar button absorbs the free space (pushes the button
+ * group to the right edge). Subsequent buttons sit adjacent, separated only by
+ * the status bar's `gap`, so memory + settings stay together. */
+.sidebar-settings-btn ~ .sidebar-settings-btn {
+  margin-left: 0;
 }
 
 .sidebar-settings-btn:hover {
@@ -1456,117 +1685,28 @@ html, body, #root {
   color: var(--text-muted);
 }
 
-/* Single-command loop */
-.loop-this-row {
-  margin-top: 4px;
+
+/* Archived chat: composer replaced by an inert banner (no executor, read-only). */
+.archived-composer-banner {
   display: flex;
-  justify-content: flex-end;
-}
-
-.loop-this-btn {
-  opacity: 0;
-  transition: opacity 0.15s, background 0.15s, color 0.15s;
-  background: none;
-  border: none;
-  color: var(--text-muted);
-  font-size: 11px;
-  cursor: pointer;
-  padding: 2px 8px;
-  border-radius: 5px;
-}
-
-.message:hover .loop-this-btn {
-  opacity: 1;
-}
-
-.loop-this-btn:hover {
-  color: var(--accent);
-  background: var(--bg-hover);
-}
-
-.loop-dialog {
-  position: fixed;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
-  background: var(--bg-secondary);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 24px;
-  z-index: 2000;
-  max-width: 480px;
-  width: 90%;
-  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
-}
-
-.loop-dialog h3 {
-  margin-bottom: 12px;
-  font-size: 15px;
-}
-
-.loop-dialog-preview {
-  background: var(--bg-tertiary);
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 14px 16px;
+  margin: 8px;
+  border: 1px dashed var(--border);
   border-radius: 8px;
-  padding: 10px 12px;
+  background: var(--bg-secondary);
+  color: var(--text-muted);
   font-size: 13px;
-  color: var(--text-secondary);
-  line-height: 1.5;
-  max-height: 120px;
-  overflow-y: auto;
-  white-space: pre-wrap;
-  word-break: break-word;
-  margin-bottom: 16px;
 }
-
-.loop-dialog-field {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  font-size: 13px;
-  color: var(--text-secondary);
-  margin-bottom: 20px;
-}
-
-.loop-dialog-field input {
-  padding: 8px 10px;
-  background: var(--input-bg);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  color: var(--text-primary);
-  font-size: 14px;
-  outline: none;
-}
-
-.loop-dialog-field input:focus {
-  border-color: var(--accent);
-}
-
-.loop-dialog-actions {
-  display: flex;
-  gap: 8px;
-  justify-content: flex-end;
-}
-
-.loop-dialog-cancel,
-.loop-dialog-start {
-  padding: 8px 16px;
-  border-radius: 6px;
-  border: none;
-  font-size: 13px;
-  cursor: pointer;
-  font-weight: 500;
-}
-
-.loop-dialog-cancel {
-  background: var(--bg-tertiary);
-  color: var(--text-secondary);
-}
-
-.loop-dialog-start {
+.archived-unarchive-btn {
   background: var(--accent);
   color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 6px 12px;
+  font-size: 12px;
+  cursor: pointer;
 }
-
-.loop-dialog-start:hover {
-  background: var(--accent-hover);
-}
+.archived-unarchive-btn:hover { opacity: 0.9; }
