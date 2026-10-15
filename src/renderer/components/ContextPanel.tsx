@@ -1,5 +1,12 @@
 import React, { useRef } from 'react';
-import type { ContextItem } from '../App';
+
+interface ContextItem {
+  id: string;
+  type: 'file' | 'folder' | 'url' | 'text';
+  name: string;
+  path?: string;
+  content: string;
+}
 
 interface ContextPanelProps {
   items: ContextItem[];

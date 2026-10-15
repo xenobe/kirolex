@@ -33,3 +33,10 @@ npm-debug.log*
 
 # Misc
 *.tgz
+
+# Agent / tool scratch, not part of the app. Without these a plain `git add .`
+# quietly commits browser-automation traces, local agent config and stray
+# screenshots that happened to be saved into the repo root.
+.playwright-mcp/
+.kiro/
+/*.png

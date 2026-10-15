@@ -1,16 +1,23 @@
 {
   "name": "kirolex",
   "version": "0.1.0",
+  "author": "KiroLex contributors",
   "description": "KiroLex - Desktop chat client powered by kiro-cli ACP",
   "main": "dist/main/index.js",
   "scripts": {
     "dev": "concurrently -k \"npm run dev:renderer\" \"npm run dev:main\"",
     "dev:renderer": "vite",
-    "dev:main": "tsc -p tsconfig.main.json && set NODE_ENV=development&& electron .",
+    "dev:main": "tsc -p tsconfig.main.json && electron . --dev",
     "build": "tsc -p tsconfig.main.json && vite build",
     "start": "electron .",
     "package": "npm run build && electron-builder --win --dir",
-    "package:installer": "npm run build && electron-builder --win"
+    "package:installer": "npm run build && electron-builder --win",
+    "start:dev": "electron . --dev",
+    "dev:hot": "node scripts/dev-hot.mjs",
+    "test": "node --test \"tests/**/*.test.ts\"",
+    "test:watch": "node --test --watch \"tests/**/*.test.ts\"",
+    "package:mac": "npm run build && electron-builder --mac",
+    "package:mac:dir": "npm run build && electron-builder --mac --dir"
   },
   "build": {
     "appId": "com.kirolex.app",
@@ -20,12 +27,26 @@
     ],
     "win": {
       "target": "portable",
-      "icon": "build/icon.ico"
+      "icon": "build/icon.png"
     },
     "mac": {
       "category": "public.app-category.developer-tools",
-      "target": "dir",
-      "icon": "build/icon.icns"
+      "icon": "build/icon.icns",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "arm64"
+          ]
+        }
+      ],
+      "identity": null
     },
     "portable": {
       "artifactName": "KiroLex.exe"
