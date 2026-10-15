@@ -10,7 +10,14 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
-    "declaration": true
+    "declaration": true,
+    // Lets a main-process module import a sibling as './x.ts' and still emit './x.js'.
+    // The point is that `node --test` can then load these files directly: it strips
+    // types but does not resolve extensionless specifiers, so an untestable module was
+    // previously the price of importing a neighbour (see the injected SshTools in
+    // loopVerify.ts, which exists only to work around this).
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true
   },
   "include": ["src/main/**/*"]
 }

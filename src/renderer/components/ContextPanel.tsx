@@ -1,5 +1,13 @@
 import React, { useRef } from 'react';
-import type { ContextItem } from '../App';
+import { useT } from '../hooks/useLang';
+
+interface ContextItem {
+  id: string;
+  type: 'file' | 'folder' | 'url' | 'text';
+  name: string;
+  path?: string;
+  content: string;
+}
 
 interface ContextPanelProps {
   items: ContextItem[];
@@ -15,6 +23,7 @@ export const ContextPanel: React.FC<ContextPanelProps> = ({
   onToggle,
 }) => {
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const t = useT();
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
@@ -86,7 +95,7 @@ export const ContextPanel: React.FC<ContextPanelProps> = ({
   return (
     <div className="context-panel" onDrop={handleDrop} onDragOver={handleDragOver}>
       <div className="context-panel-header">
-        <h3>📎 Context</h3>
+        <h3>{`📎 ${t('Context')}`}</h3>
         <button
           onClick={onToggle}
           style={{
@@ -136,14 +145,14 @@ export const ContextPanel: React.FC<ContextPanelProps> = ({
           className="add-context-btn"
           onClick={() => fileInputRef.current?.click()}
         >
-          + Add File
+          {`＋ ${t('Add File')}`}
         </button>
         <button
           className="add-context-btn"
           onClick={handleAddText}
           style={{ marginTop: 4 }}
         >
-          + Add Text
+          {`＋ ${t('Add Text')}`}
         </button>
       </div>
 
